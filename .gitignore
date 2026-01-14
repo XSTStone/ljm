@@ -1,0 +1,25 @@
+# 虚拟环境
+venv/
+*.pyc
+__pycache__/
+
+# 日志文件
+*.log
+
+# 结果文件
+Result/
+
+# 数据文件
+data/
+
+# 压缩包
+*.tar.gz
+
+# 图片文件
+show_img/
+
+# IDE配置
+.idea/
+.vscode/
+*.swp
+*.swo
