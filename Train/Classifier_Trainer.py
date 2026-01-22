@@ -3,13 +3,17 @@
 # Time:2022/7/4 20:40
 import torch
 import time
+import numpy as np
+# 1. 引入 sklearn 计算指标
+from sklearn.metrics import accuracy_score, cohen_kappa_score, f1_score
 
 def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, device, wd=0, lr_jitter=False):
     trainer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(trainer, T_max=num_epochs * len(train_iter), eta_min=5e-6)
-    #新增初始化最佳精度和最佳精度记录
+    #新增初始化最佳精度
     best_acc = 0.0
-    best_epochs = []  # 记录所有最佳精度的迭代
+    best_kappa = 0.0  # 初始化最佳 Kappa
+    best_f1 = 0.0  # 初始化最佳 F1
     #
     for epoch in range(num_epochs):
         # training
@@ -39,8 +43,10 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
         # test
         #修改 改为每个epoch都计算一遍，删除了if epoch == num_epochs - 1:
         #if epoch == num_epochs - 1:
+        all_preds = []
+        all_labels = []
         net.eval()
-        val_sum_acc = 0.0
+        #val_sum_acc = 0.0
         with torch.no_grad():
             for (X, y) in valid_iter:
                 X = X.type(torch.FloatTensor)
@@ -48,12 +54,20 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
                 X = X.to(device)
                 y = y.to(device)
                 y_hat = net(X)
-                val_sum_acc += (y == y_hat.argmax(dim=-1)).float().mean()
-        current_val_acc = val_sum_acc / len(valid_iter)
+
+                preds = y_hat.argmax(dim=-1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(y.cpu().numpy())
+                #val_sum_acc += (y == y_hat.argmax(dim=-1)).float().mean()
+        #current_val_acc = val_sum_acc / len(valid_iter)
+        current_val_acc = accuracy_score(all_labels, all_preds)
+        current_kappa = cohen_kappa_score(all_labels, all_preds)
+        current_f1 = f1_score(all_labels, all_preds, average='macro')
         #新增：比较并且保存最佳模型
         if current_val_acc > best_acc:
             best_acc = current_val_acc
-            best_epochs.append((epoch + 1, best_acc))  # 保存epoch和对应的最佳精度
+            best_kappa = current_kappa
+            best_f1 = current_f1
             # 如果你想保存权重文件，把下面这行注释取消掉：
             # torch.save(net.state_dict(), 'best_model.pth')
             print(f"  [New Best] Epoch {epoch + 1}: Acc updated to {best_acc:.3f}")
@@ -64,4 +78,4 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
     print(
         f'training finished at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())} with best_valid_acc={best_acc:.3f}')
     torch.cuda.empty_cache()
-    return best_acc.cpu().data, best_epochs
+    return best_acc, best_kappa, best_f1

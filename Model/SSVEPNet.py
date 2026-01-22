@@ -38,61 +38,80 @@ class AFFB(nn.Module):
         x_filtered = torch.mean(torch.stack(out_list, dim=1), dim=1)
         return x_filtered  # 保持原始 shape: [Batch, 1, Channels, T]
 
-#创建CBAM模块
+#创建CTA模块
 class ChannelAttention(nn.Module):
-    def __init__(self, in_planes, ratio=16):
+    def __init__(self, in_planes, ratio=2):
         super(ChannelAttention, self).__init__()
-        # 改为 1D 的自适应池化
+        # 对应论文 Eq (7)
+        # 针对 1D 时间序列: [Batch, Channel, Time]
+        # Global Avg & Max Pooling 压缩 Time 维度
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
         self.max_pool = nn.AdaptiveMaxPool1d(1)
 
-        # 用 1D 卷积或者全连接层做 MLP
+        # 共享 MLP (Shared Weight Multilayer Perceptron)
+        # 论文提到: neuron = C -> C/r -> C
         self.fc1 = nn.Conv1d(in_planes, in_planes // ratio, 1, bias=False)
         self.relu1 = nn.ReLU()
         self.fc2 = nn.Conv1d(in_planes // ratio, in_planes, 1, bias=False)
+
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # x: [Batch, Channel, Time]
+        # avg_out: [Batch, Channel, 1]
         avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
         max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+
+        # 对应论文 Eq (7) & (8): Wc(X) * X
         out = avg_out + max_out
-        return self.sigmoid(out)
+        return x * self.sigmoid(out)
 
 
-class SpatialAttention(nn.Module):
-    def __init__(self, kernel_size=7):
-        super(SpatialAttention, self).__init__()
-        # 确保 kernel_size 是奇数，保证 padding 后尺寸不变
+class TimeAttention(nn.Module):
+    def __init__(self, kernel_size=3):
+        super(TimeAttention, self).__init__()
+        # 对应论文 Eq (9) & (10)
+        # 论文 Table II 中提到 kernel size = 3x3 (针对2D输入)
+        # 针对 1D 时间序列，我们使用 kernel size = 3 的 Conv1d
         assert kernel_size % 2 == 1, "Kernel size must be odd"
         padding = kernel_size // 2
 
-        # 改为 1D 卷积，处理时间轴
+        # 输入通道为2 (AvgPool + MaxPool 的结果拼接)
         self.conv1 = nn.Conv1d(2, 1, kernel_size, padding=padding, bias=False)
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
         # x: [Batch, Channel, Time]
-        # 在通道维度 (dim=1) 做池化
+
+        # 沿着通道维度进行池化 -> [Batch, 1, Time]
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x = torch.cat([avg_out, max_out], dim=1)  # [Batch, 2, Time]
-        x = self.conv1(x)
-        return self.sigmoid(x)
+
+        # 拼接 -> [Batch, 2, Time]
+        x_cat = torch.cat([avg_out, max_out], dim=1)
+
+        # 卷积 + Sigmoid -> 生成时间权重
+        scale = self.sigmoid(self.conv1(x_cat))
+
+        # 对应论文 Eq (10): Ws(X) * X
+        return x * scale
 
 
-class CBAM(nn.Module):
-    def __init__(self, planes, ratio=16, kernel_size=7):
-        super(CBAM, self).__init__()
+class CTA(nn.Module):
+    '''
+    Channel-Time Attention Module
+    串行结构：先 Channel Attention 后 Time Attention
+    '''
+
+    def __init__(self, planes, ratio=2, kernel_size=3):
+        super(CTA, self).__init__()
         self.ca = ChannelAttention(planes, ratio)
-        self.sa = SpatialAttention(kernel_size)
+        self.ta = TimeAttention(kernel_size)
 
     def forward(self, x):
-        # 1. Channel Attention
-        out = x * self.ca(x)
-        # 2. Spatial (Temporal) Attention
-        result = out * self.sa(out)
-        return result
+        x = self.ca(x)
+        x = self.ta(x)
+        return x
 class LSTM(nn.Module):
     '''
         Employ the Bi-LSTM to learn the reliable dependency between spatio-temporal features
@@ -181,37 +200,39 @@ class ESNet(nn.Module):
         super(ESNet, self).__init__()
         self.dropout_level = 0.5
 
-        #修改：加入AFFB
+        # 1. AFFB 模块
         self.affb = AFFB(channels=num_channels, T=T, num_filters=3)
-        #
 
         self.F = [num_channels * 2] + [num_channels * 4]
         self.K = 10
         self.S = 2
 
+        # 2. 卷积特征提取层
         net = []
         net.append(self.spatial_block(num_channels, self.dropout_level))
-        net.append(self.enhanced_block(self.F[0], self.F[1], self.dropout_level,
-                                           self.K, self.S))
-
+        net.append(self.enhanced_block(self.F[0], self.F[1], self.dropout_level, self.K, self.S))
         self.conv_layers = nn.Sequential(*net)
 
-        #修改：增加SE
-        #self.se = SELayer(channel=self.F[1], reduction=2)
-        #
-
-        #把原来的SE变成CBAM
-        #
-        feature_dim = num_channels * 4
-        self.cbam = CBAM(planes=feature_dim, ratio=16, kernel_size=7)
-        #
-
+        # 3. 计算卷积层输出维度
+        # calculateOutSize 返回的是 (Channels, Height, Time)，例如 (256, 1, 60)
         self.fcSize = self.calculateOutSize(self.conv_layers, num_channels, T)
-        self.fcUnit = self.fcSize[0] * self.fcSize[1] * self.fcSize[2] * 2
+
+        # 4. CTA 模块
+        self.cta = CTA(planes=self.F[1], ratio=2, kernel_size=3)
+
+        # 5. LSTM
+        self.rnn = LSTM(input_size=self.F[1], hidden_size=self.F[1])
+
+        # 6. 全连接分类层 (关键修改点！)
+        # 修正维度计算：Time * Channel * 2
+        # self.fcSize[2] 是时间维度(约60)，self.fcSize[0] 是通道维度(256)
+        self.fcUnit = self.fcSize[2] * self.fcSize[0] * 2
+
+        # 打印一下维度，确保正确 (调试用)
+        print(f"Calculated fcUnit: {self.fcUnit} (Should be around 30720)")
+
         self.D1 = self.fcUnit // 10
         self.D2 = self.D1 // 5
-
-        self.rnn = LSTM(input_size=self.F[1], hidden_size=self.F[1])
 
         self.dense_layers = nn.Sequential(
             nn.Flatten(),
@@ -220,25 +241,18 @@ class ESNet(nn.Module):
             nn.Linear(self.D1, self.D2),
             nn.PReLU(),
             nn.Dropout(self.dropout_level),
-            nn.Linear(self.D2, num_classes))
+            nn.Linear(self.D2, num_classes)
+        )
 
     def forward(self, x):
-        # --- DEBUG START: 打印输入形状 ---
-        #print(f"\n[DEBUG] Input x shape: {x.shape}")
         #修改：第一步进行自适应滤波
         x = self.affb(x)
-        #print(f"[DEBUG] After AFFB: {x.shape}")
 
         out = self.conv_layers(x)
         out = out.squeeze(2)
         #增加：se
         #out = self.se(out)
-        #应用 CBAM
-        # --- DEBUG: 检查进入 CBAM 前的形状 ---
-        #print(f"[DEBUG] Before CBAM: {out.shape}")
-        # 这里的 Channels 维度必须等于 256！
-        out = self.cbam(out)
-        #print(f"[DEBUG] After CBAM: {out.shape}")
+        out = self.cta(out)
         r_out = self.rnn(out)
         out = self.dense_layers(r_out)
         return out

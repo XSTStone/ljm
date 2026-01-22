@@ -73,7 +73,7 @@ class getSSVEP2020Intra(Dataset):
       eeg_data = torch.from_numpy(eeg_data.swapaxes(0, 1))  # (8, 180, 1024) -> (180, 8, 1024)
       eeg_data = eeg_data.reshape(-1, 1, self.Nc, self.Nt)  #(试次，1，NC,NT)符合CNN的输入
       print(eeg_data.shape)
-      return eeg_data
+      return eeg_data.float()
 
    # get the single label data
    def get_DataLabel(self):
