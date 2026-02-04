@@ -14,6 +14,9 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
     best_acc = 0.0
     best_kappa = 0.0  # 初始化最佳 Kappa
     best_f1 = 0.0  # 初始化最佳 F1
+
+    best_preds = []
+    best_labels = []
     #
     for epoch in range(num_epochs):
         # training
@@ -68,6 +71,9 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
             best_acc = current_val_acc
             best_kappa = current_kappa
             best_f1 = current_f1
+
+            best_preds = all_preds
+            best_labels = all_labels
             # 如果你想保存权重文件，把下面这行注释取消掉：
             # torch.save(net.state_dict(), 'best_model.pth')
             print(f"  [New Best] Epoch {epoch + 1}: Acc updated to {best_acc:.3f}")
@@ -78,4 +84,4 @@ def train_on_batch(num_epochs, train_iter, valid_iter, lr, criterion, net, devic
     print(
         f'training finished at {time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())} with best_valid_acc={best_acc:.3f}')
     torch.cuda.empty_cache()
-    return best_acc, best_kappa, best_f1
+    return best_acc, best_kappa, best_f1, best_preds, best_labels

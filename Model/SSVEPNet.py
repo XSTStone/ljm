@@ -7,36 +7,147 @@ from Utils import Constraint
 import torch.fft
 
 #创建AFFB模块
-class AFFB(nn.Module):
-    def __init__(self, channels, T, num_filters=3):
-        super(AFFB, self).__init__()
-        self.num_filters = num_filters
-        self.channels = channels
-        self.T = T
+# class AFFB(nn.Module):
+#     def __init__(self, channels, T, num_filters=3):
+#         super(AFFB, self).__init__()
+#         self.num_filters = num_filters
+#         self.channels = channels
+#         self.T = T
+#
+#         # 定义可学习的频域掩码参数 (Filters, Channels, Half_T)
+#         # 初始化为1，表示全通。训练过程中模型会学习将其某些频点变为0（滤波）
+#         self.freq_mask = nn.Parameter(torch.ones(num_filters, 1, 1, T // 2 + 1))
+#
+#     def forward(self, x):
+#         # x shape: [Batch, 1, Channels, T]
+#
+#         # 1. 快速傅里叶变换到频域
+#         x_fft = torch.fft.rfft(x, dim=-1)  # 输出 shape: [Batch, 1, Channels, T//2 + 1]
+#
+#         # 2. 应用多个并行的自适应滤波器
+#         # 扩展维度进行广播相乘
+#         out_list = []
+#         for i in range(self.num_filters):
+#             mask = torch.sigmoid(self.freq_mask[i])  # 使用sigmoid限制增益在0-1之间
+#             filtered_fft = x_fft * mask
+#             # 3. 逆变换回时域
+#             out_list.append(torch.fft.irfft(filtered_fft, n=self.T, dim=-1))
+#
+#         # 4. 将多个滤波后的分支拼接或相加
+#         # 这里建议拼接后通过一个1x1卷积降维，或者直接相加
+#         x_filtered = torch.mean(torch.stack(out_list, dim=1), dim=1)
+#         return x_filtered  # 保持原始 shape: [Batch, 1, Channels, T]
 
-        # 定义可学习的频域掩码参数 (Filters, Channels, Half_T)
-        # 初始化为1，表示全通。训练过程中模型会学习将其某些频点变为0（滤波）
-        self.freq_mask = nn.Parameter(torch.ones(num_filters, 1, 1, T // 2 + 1))
+#修改AFFB模块
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+
+# [修改点] 重写 AFFB 为论文描述的 SincFilter
+class AFFB(nn.Module):
+    def __init__(self, channels, T, num_filters=3, kernel_length=15, fs=256):
+        """
+        SincFilter 实现
+        kernel_length: 论文表1中提到 Kernel size 为 33 [cite: 196]
+        """
+        super(AFFB, self).__init__()
+
+        self.num_filters = num_filters
+        self.kernel_length = kernel_length
+        self.fs = fs
+
+        # 确保卷积核长度为奇数
+        if kernel_length % 2 == 0:
+            self.kernel_length = self.kernel_length + 1
+
+        # 初始化 f1 (低频) 和 band (带宽)
+        # 我们初始化为均匀分布在 4Hz - 40Hz 之间，方便训练
+        # 论文提到使用 mel scale 初始化，这里简化为线性分布即可
+        low_freqs = np.linspace(4, 50, num_filters)
+        bandwidths = np.linspace(6, 12, num_filters)
+
+        # 将频率转换为归一化频率 (0 ~ 0.5, 对应 0 ~ fs/2)
+        # 论文公式涉及 2*pi*f，这里为了方便直接学习 Hz 对应的归一化值
+        self.f1 = nn.Parameter(torch.tensor(low_freqs / fs, dtype=torch.float32).view(-1, 1))
+        self.band = nn.Parameter(torch.tensor(bandwidths / fs, dtype=torch.float32).view(-1, 1))
+
+        # 生成 Hamming 窗 [cite: 271]
+        n = torch.arange(0, self.kernel_length).float()
+        self.window = 0.54 - 0.46 * torch.cos(2 * np.pi * n / (self.kernel_length - 1))
+        self.window = nn.Parameter(self.window.view(1, -1), requires_grad=False)
+
+        # 对应论文的时间轴 n [cite: 260]
+        # 对称中心在 (L-1)/2
+        self.n = (n - (self.kernel_length - 1) / 2).view(1, -1)
+        self.n = nn.Parameter(self.n, requires_grad=False)
 
     def forward(self, x):
-        # x shape: [Batch, 1, Channels, T]
+        # x shape: [Batch, 1, Channels, Time] 或者是 [Batch, Channels, Time]
+        # 确保输入是 4D: [Batch, 1, Channels, Time] 以适配 Conv2d 逻辑
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
 
-        # 1. 快速傅里叶变换到频域
-        x_fft = torch.fft.rfft(x, dim=-1)  # 输出 shape: [Batch, 1, Channels, T//2 + 1]
+        # 1. 限制频率参数范围 [cite: 265]
+        # f1 > 0, band > 0
+        f1 = torch.abs(self.f1)
+        f2 = f1 + torch.abs(self.band)
 
-        # 2. 应用多个并行的自适应滤波器
-        # 扩展维度进行广播相乘
-        out_list = []
-        for i in range(self.num_filters):
-            mask = torch.sigmoid(self.freq_mask[i])  # 使用sigmoid限制增益在0-1之间
-            filtered_fft = x_fft * mask
-            # 3. 逆变换回时域
-            out_list.append(torch.fft.irfft(filtered_fft, n=self.T, dim=-1))
+        # 2. 生成 Sinc 滤波器
+        # bandpass = 2*f2*sinc(2*pi*f2*n) - 2*f1*sinc(2*pi*f1*n)
+        # 注意：这里的 f1, f2 是归一化频率 (f/fs)
 
-        # 4. 将多个滤波后的分支拼接或相加
-        # 这里建议拼接后通过一个1x1卷积降维，或者直接相加
-        x_filtered = torch.mean(torch.stack(out_list, dim=1), dim=1)
-        return x_filtered  # 保持原始 shape: [Batch, 1, Channels, T]
+        # 避免除以0，sinc(0)=1，但在 torch 里 sin(x)/x 需要处理 x=0
+        # PyTorch 的 torch.sinc(x) 定义为 sin(pi*x)/(pi*x)，所以我们需要调整输入
+
+        # 转换为角频率参数输入给 torch.sinc
+        # 公式: 2 * f * sinc(2 * f * n) -> torch.sinc 定义不同，需要仔细转换
+        # 论文公式: 2*f2*sinc(2*pi*f2*n)
+        # torch.sinc(x) = sin(pi*x)/(pi*x)
+        # 令 pi*x = 2*pi*f*n => x = 2*f*n
+
+        g1 = 2 * f1 * torch.sinc(2 * f1 * self.n)
+        g2 = 2 * f2 * torch.sinc(2 * f2 * self.n)
+
+        # 带通滤波器 = 低通(f2) - 低通(f1)
+        g_filter = g2 - g1
+
+        # 3. 应用 Hamming 窗 [cite: 273]
+        g_filter = g_filter * self.window
+
+        # 4. 归一化滤波器权重
+        g_filter = g_filter / torch.norm(g_filter, dim=-1, keepdim=True)
+
+        # 5. 准备卷积核
+        # 我们的滤波器是针对时间维度的，应用于所有通道
+        # Conv2d weight shape: [out_channels, in_channels, kH, kW]
+        # 这里我们希望 num_filters 个滤波器并行输出
+        # Input: [B, 1, C, T]
+        # 我们想对 T 维度卷积。可以将 C 视为 Height, T 视为 Width
+        # Kernel size: (1, kernel_length)
+
+        filters = g_filter.view(self.num_filters, 1, 1, self.kernel_length)
+
+        # 对输入进行卷积
+        # 这是一个针对 Time 维度的 2D 卷积
+        # x: [Batch, 1, Channels, Time]
+        # filters: [num_filters, 1, 1, kernel_length]
+        # 输出: [Batch, num_filters, Channels, Time]
+
+        # 为了保持输出维度一致，需要 Padding
+        padding = self.kernel_length // 2
+
+        # 此时是一个多通道卷积
+        out = F.conv2d(x, filters, padding=(0, padding))
+
+        # 6. 融合 Filter 维度
+        # 论文没有详细说明多个 Filter 怎么融合，通常是拼接或者求平均
+        # 你的上一版代码用了 mean，这里我们保持一致，融合 num_filters 维度
+        # out shape: [Batch, num_filters, Channels, Time] -> [Batch, 1, Channels, Time]
+
+        # 也可以使用 1x1 卷积来融合，这里简单起见用 mean
+        return torch.mean(out, dim=1, keepdim=True)
 
 #创建CTA模块
 class ChannelAttention(nn.Module):
@@ -201,7 +312,7 @@ class ESNet(nn.Module):
         self.dropout_level = 0.5
 
         # 1. AFFB 模块
-        self.affb = AFFB(channels=num_channels, T=T, num_filters=3)
+        self.affb = AFFB(channels=num_channels, T=T, num_filters=16)
 
         self.F = [num_channels * 2] + [num_channels * 4]
         self.K = 10
